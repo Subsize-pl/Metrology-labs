@@ -1,3 +1,17 @@
+import com.sun.source.tree.AssignmentTree;
+import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.CompoundAssignmentTree;
+import com.sun.source.tree.ImportTree;
+import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.Tree;
+import com.sun.source.tree.VariableTree;
+import com.sun.source.util.JavacTask;
+import com.sun.source.util.SourcePositions;
+import com.sun.source.util.TreePathScanner;
+import com.sun.source.util.Trees;
+import java.io.IOException;
+import java.net.URI;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -7,6 +21,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import javax.tools.JavaCompiler;
+import javax.tools.JavaFileObject;
+import javax.tools.SimpleJavaFileObject;
+import javax.tools.ToolProvider;
 
 public final class JavaHalsteadAnalyzer {
     private static final Set<String> KEYWORDS = new HashSet<>(Arrays.asList(
@@ -34,19 +52,26 @@ public final class JavaHalsteadAnalyzer {
 
     public HalsteadMetrics analyze(String source) {
         List<Token> tokens = tokenize(source);
+        SyntaxContext syntax = inspectSyntax(source, tokens);
         Map<String, Integer> operators = new LinkedHashMap<>();
         Map<String, Integer> operands = new LinkedHashMap<>();
         Deque<String> parenthesisKinds = new ArrayDeque<>();
 
         for (int index = 0; index < tokens.size(); index++) {
+            if (syntax.ignored[index]) {
+                continue;
+            }
+
             Token current = tokens.get(index);
-            Token previous = index > 0 ? tokens.get(index - 1) : null;
-            Token next = index + 1 < tokens.size() ? tokens.get(index + 1) : null;
+            Token previous = previousVisibleToken(tokens, syntax.ignored, index);
+            Token next = nextVisibleToken(tokens, syntax.ignored, index);
 
             if (current.type == TokenType.IDENTIFIER
                     && next != null && "(".equals(next.text)) {
                 increment(operators, current.text + "()");
-                increment(operands, current.text);
+                if (syntax.isInsideAssignment(current.start)) {
+                    increment(operands, current.text);
+                }
                 continue;
             }
 
@@ -96,6 +121,50 @@ public final class JavaHalsteadAnalyzer {
         return new HalsteadMetrics(operators, operands);
     }
 
+    private static Token previousVisibleToken(List<Token> tokens,
+                                              boolean[] ignored,
+                                              int index) {
+        for (int current = index - 1; current >= 0; current--) {
+            if (!ignored[current]) {
+                return tokens.get(current);
+            }
+        }
+        return null;
+    }
+
+    private static Token nextVisibleToken(List<Token> tokens,
+                                          boolean[] ignored,
+                                          int index) {
+        for (int current = index + 1; current < tokens.size(); current++) {
+            if (!ignored[current]) {
+                return tokens.get(current);
+            }
+        }
+        return null;
+    }
+
+    private SyntaxContext inspectSyntax(String source, List<Token> tokens) {
+        SyntaxContext context = new SyntaxContext(tokens);
+        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+        if (compiler == null) {
+            return context;
+        }
+
+        JavaFileObject sourceFile = new SourceFile(source);
+        try {
+            JavacTask task = (JavacTask) compiler.getTask(
+                    null, null, diagnostic -> { },
+                    List.of("-proc:none"), null, List.of(sourceFile));
+            CompilationUnitTree unit = task.parse().iterator().next();
+            Trees trees = Trees.instance(task);
+            SourcePositions positions = trees.getSourcePositions();
+            new DeclarationScanner(unit, positions, context).scan(unit, null);
+        } catch (IOException | RuntimeException ignored) {
+            // Если синтаксическое дерево не построено, остаётся лексический анализ.
+        }
+        return context;
+    }
+
     private List<Token> tokenize(String source) {
         List<Token> tokens = new ArrayList<>();
         int position = 0;
@@ -118,13 +187,15 @@ public final class JavaHalsteadAnalyzer {
 
             if (current == '"') {
                 ScanResult literal = scanQuoted(source, position, '"');
-                tokens.add(new Token(literal.text, TokenType.LITERAL));
+                tokens.add(new Token(literal.text, TokenType.LITERAL,
+                        position, literal.nextPosition));
                 position = literal.nextPosition;
                 continue;
             }
             if (current == '\'') {
                 ScanResult literal = scanQuoted(source, position, '\'');
-                tokens.add(new Token(literal.text, TokenType.LITERAL));
+                tokens.add(new Token(literal.text, TokenType.LITERAL,
+                        position, literal.nextPosition));
                 position = literal.nextPosition;
                 continue;
             }
@@ -138,7 +209,7 @@ public final class JavaHalsteadAnalyzer {
                 String word = source.substring(position, end);
                 TokenType type = KEYWORDS.contains(word)
                         ? TokenType.OPERATOR : TokenType.IDENTIFIER;
-                tokens.add(new Token(word, type));
+                tokens.add(new Token(word, type, position, end));
                 position = end;
                 continue;
             }
@@ -146,18 +217,20 @@ public final class JavaHalsteadAnalyzer {
             if (Character.isDigit(current)) {
                 int end = scanNumber(source, position);
                 tokens.add(new Token(source.substring(position, end),
-                        TokenType.LITERAL));
+                        TokenType.LITERAL, position, end));
                 position = end;
                 continue;
             }
 
             String symbol = findLongestSymbol(source, position);
             if (symbol != null) {
-                tokens.add(new Token(symbol, TokenType.OPERATOR));
+                tokens.add(new Token(symbol, TokenType.OPERATOR,
+                        position, position + symbol.length()));
                 position += symbol.length();
             } else {
-                // Preserve an unknown character as an operator instead of hiding it.
-                tokens.add(new Token(String.valueOf(current), TokenType.OPERATOR));
+                // Неизвестный символ сохраняется как оператор, а не теряется.
+                tokens.add(new Token(String.valueOf(current), TokenType.OPERATOR,
+                        position, position + 1));
                 position++;
             }
         }
@@ -243,10 +316,14 @@ public final class JavaHalsteadAnalyzer {
     private static final class Token {
         private final String text;
         private final TokenType type;
+        private final int start;
+        private final int end;
 
-        private Token(String text, TokenType type) {
+        private Token(String text, TokenType type, int start, int end) {
             this.text = text;
             this.type = type;
+            this.start = start;
+            this.end = end;
         }
     }
 
@@ -257,6 +334,237 @@ public final class JavaHalsteadAnalyzer {
         private ScanResult(String text, int nextPosition) {
             this.text = text;
             this.nextPosition = nextPosition;
+        }
+    }
+
+    private static final class SourceRange {
+        private final long start;
+        private final long end;
+
+        private SourceRange(long start, long end) {
+            this.start = start;
+            this.end = end;
+        }
+
+        private boolean contains(int position) {
+            return position >= start && position < end;
+        }
+    }
+
+    private static final class SyntaxContext {
+        private final List<Token> tokens;
+        private final boolean[] ignored;
+        private final List<SourceRange> assignmentRanges = new ArrayList<>();
+
+        private SyntaxContext(List<Token> tokens) {
+            this.tokens = tokens;
+            ignored = new boolean[tokens.size()];
+        }
+
+        private void ignore(long start, long end) {
+            if (start < 0 || end < start) {
+                return;
+            }
+            for (int index = 0; index < tokens.size(); index++) {
+                Token token = tokens.get(index);
+                if (token.start >= start && token.end <= end) {
+                    ignored[index] = true;
+                }
+            }
+        }
+
+        private void ignoreToken(int index) {
+            if (index >= 0 && index < ignored.length) {
+                ignored[index] = true;
+            }
+        }
+
+        private void addAssignmentRange(long start, long end) {
+            if (start >= 0 && end >= start) {
+                assignmentRanges.add(new SourceRange(start, end));
+            }
+        }
+
+        private boolean isInsideAssignment(int position) {
+            for (SourceRange range : assignmentRanges) {
+                if (range.contains(position)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private int findLastToken(String text, long start, long end) {
+            for (int index = tokens.size() - 1; index >= 0; index--) {
+                Token token = tokens.get(index);
+                if (token.start >= start && token.end <= end
+                        && text.equals(token.text)) {
+                    return index;
+                }
+            }
+            return -1;
+        }
+
+        private int findLastIdentifier(String name, long start, long end) {
+            for (int index = tokens.size() - 1; index >= 0; index--) {
+                Token token = tokens.get(index);
+                if (token.start >= start && token.end <= end
+                        && token.type == TokenType.IDENTIFIER
+                        && name.equals(token.text)) {
+                    return index;
+                }
+            }
+            return -1;
+        }
+
+        private long findClassBodyStart(long start, long end) {
+            for (Token token : tokens) {
+                if (token.start >= start && token.end <= end
+                        && "{".equals(token.text)) {
+                    return token.start;
+                }
+            }
+            return -1;
+        }
+
+        private void ignoreFollowingDelimiter(long end) {
+            for (int index = 0; index < tokens.size(); index++) {
+                Token token = tokens.get(index);
+                if (token.start >= end) {
+                    if (";".equals(token.text) || ",".equals(token.text)) {
+                        ignoreToken(index);
+                    }
+                    return;
+                }
+            }
+        }
+
+        private void ignorePreviousComma(long start) {
+            for (int index = tokens.size() - 1; index >= 0; index--) {
+                Token token = tokens.get(index);
+                if (token.end <= start) {
+                    if (",".equals(token.text)) {
+                        ignoreToken(index);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    private static final class DeclarationScanner
+            extends TreePathScanner<Void, Void> {
+        private final CompilationUnitTree unit;
+        private final SourcePositions positions;
+        private final SyntaxContext context;
+
+        private DeclarationScanner(CompilationUnitTree unit,
+                                   SourcePositions positions,
+                                   SyntaxContext context) {
+            this.unit = unit;
+            this.positions = positions;
+            this.context = context;
+        }
+
+        @Override
+        public Void visitImport(ImportTree node, Void unused) {
+            long start = start(node);
+            long end = end(node);
+            context.ignore(start, end);
+            context.ignoreFollowingDelimiter(end);
+            return null;
+        }
+
+        @Override
+        public Void visitClass(ClassTree node, Void unused) {
+            long declarationStart = start(node);
+            long declarationEnd = end(node);
+            long bodyStart = context.findClassBodyStart(
+                    declarationStart, declarationEnd);
+            if (bodyStart >= 0) {
+                context.ignore(declarationStart, bodyStart);
+            } else {
+                context.ignore(declarationStart, declarationEnd);
+            }
+            return super.visitClass(node, unused);
+        }
+
+        @Override
+        public Void visitMethod(MethodTree node, Void unused) {
+            long declarationStart = start(node);
+            long declarationEnd = end(node);
+            if (node.getBody() == null) {
+                context.ignore(declarationStart, declarationEnd);
+                context.ignoreFollowingDelimiter(declarationEnd);
+            } else {
+                context.ignore(declarationStart, start(node.getBody()));
+            }
+            return super.visitMethod(node, unused);
+        }
+
+        @Override
+        public Void visitVariable(VariableTree node, Void unused) {
+            long declarationStart = start(node);
+            long declarationEnd = end(node);
+            if (node.getInitializer() == null) {
+                context.ignore(declarationStart, declarationEnd);
+                context.ignoreFollowingDelimiter(declarationEnd);
+            } else {
+                long initializerStart = start(node.getInitializer());
+                long initializerEnd = end(node.getInitializer());
+                int assignment = context.findLastToken(
+                        "=", declarationStart, initializerStart);
+                if (assignment >= 0) {
+                    Token equalsToken = context.tokens.get(assignment);
+                    int variableName = context.findLastIdentifier(
+                            node.getName().toString(),
+                            declarationStart, equalsToken.start);
+                    context.ignore(declarationStart, equalsToken.start);
+                    if (variableName >= 0) {
+                        context.ignored[variableName] = false;
+                    }
+                    context.ignorePreviousComma(declarationStart);
+                }
+                context.addAssignmentRange(initializerStart, initializerEnd);
+            }
+            return super.visitVariable(node, unused);
+        }
+
+        @Override
+        public Void visitAssignment(AssignmentTree node, Void unused) {
+            context.addAssignmentRange(
+                    start(node.getExpression()), end(node.getExpression()));
+            return super.visitAssignment(node, unused);
+        }
+
+        @Override
+        public Void visitCompoundAssignment(CompoundAssignmentTree node,
+                                            Void unused) {
+            context.addAssignmentRange(
+                    start(node.getExpression()), end(node.getExpression()));
+            return super.visitCompoundAssignment(node, unused);
+        }
+
+        private long start(Tree tree) {
+            return positions.getStartPosition(unit, tree);
+        }
+
+        private long end(Tree tree) {
+            return positions.getEndPosition(unit, tree);
+        }
+    }
+
+    private static final class SourceFile extends SimpleJavaFileObject {
+        private final String source;
+
+        private SourceFile(String source) {
+            super(URI.create("string:///AnalyzedSource.java"), Kind.SOURCE);
+            this.source = source;
+        }
+
+        @Override
+        public CharSequence getCharContent(boolean ignoreEncodingErrors) {
+            return source;
         }
     }
 }
