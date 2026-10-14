@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="132.50mm" height="153.00mm" viewBox="0 0 132.50 153.00" font-family="'Times New Roman', Times, serif">
+<rect width="132.50" height="153.00" fill="#fff"/>
+<g fill="none" stroke="#000" stroke-width="0.35" stroke-linejoin="miter">
+<path d="M35.50 3.00 H50.50 A5.00 5.00 0 0 1 50.50 13.00 H35.50 A5.00 5.00 0 0 1 35.50 3.00 Z" fill="#fff"/>
+<polygon points="21.75,19.00 64.25,19.00 64.25,29.00 21.75,29.00" fill="#fff"/>
+<line x1="25.25" y1="19.00" x2="25.25" y2="29.00"/>
+<line x1="60.75" y1="19.00" x2="60.75" y2="29.00"/>
+<polygon points="43.00,35.00 63.00,45.00 43.00,55.00 23.00,45.00" fill="#fff"/>
+<polygon points="76.00,49.50 129.50,49.50 125.50,64.50 72.00,64.50" fill="#fff"/>
+<path d="M93.25 70.50 H108.25 A5.00 5.00 0 0 1 108.25 80.50 H93.25 A5.00 5.00 0 0 1 93.25 70.50 Z" fill="#fff"/>
+<polygon points="23.00,61.00 63.00,61.00 63.00,71.00 23.00,71.00" fill="#fff"/>
+<line x1="26.50" y1="61.00" x2="26.50" y2="71.00"/>
+<line x1="59.50" y1="61.00" x2="59.50" y2="71.00"/>
+<polygon points="18.25,77.00 71.75,77.00 67.75,92.00 14.25,92.00" fill="#fff"/>
+<polygon points="7.00,98.00 83.00,98.00 79.00,113.00 3.00,113.00" fill="#fff"/>
+<polygon points="13.25,119.00 76.75,119.00 72.75,134.00 9.25,134.00" fill="#fff"/>
+<path d="M35.50 140.00 H50.50 A5.00 5.00 0 0 1 50.50 150.00 H35.50 A5.00 5.00 0 0 1 35.50 140.00 Z" fill="#fff"/>
+<polyline points="43.00,13.00 43.00,17.44"/>
+<polyline points="43.00,29.00 43.00,33.44"/>
+<polyline points="63.00,45.00 100.75,45.00 100.75,47.94"/>
+<polyline points="100.75,64.50 100.75,68.94"/>
+<polyline points="43.00,55.00 43.00,59.44"/>
+<polyline points="43.00,71.00 43.00,75.44"/>
+<polyline points="43.00,92.00 43.00,96.44"/>
+<polyline points="43.00,113.00 43.00,117.44"/>
+<polyline points="43.00,134.00 43.00,138.44"/>
+</g>
+<g fill="#000" stroke="none">
+<polygon points="43.00,19.00 42.15,16.40 43.85,16.40"/>
+<polygon points="43.00,35.00 42.15,32.40 43.85,32.40"/>
+<polygon points="100.75,49.50 99.90,46.90 101.60,46.90"/>
+<polygon points="100.75,70.50 99.90,67.90 101.60,67.90"/>
+<polygon points="43.00,61.00 42.15,58.40 43.85,58.40"/>
+<polygon points="43.00,77.00 42.15,74.40 43.85,74.40"/>
+<polygon points="43.00,98.00 42.15,95.40 43.85,95.40"/>
+<polygon points="43.00,119.00 42.15,116.40 43.85,116.40"/>
+<polygon points="43.00,140.00 42.15,137.40 43.85,137.40"/>
+<text x="43.00" y="9.16" font-size="3.88" text-anchor="middle">Начало</text>
+<text x="43.00" y="25.16" font-size="3.88" text-anchor="middle">data = parse(args)</text>
+<text x="43.00" y="46.16" font-size="3.88" text-anchor="middle">data.length == 0?</text>
+<text x="100.75" y="55.71" font-size="3.88" text-anchor="middle">Вывод:</text>
+<text x="100.75" y="60.61" font-size="3.88" text-anchor="middle">«Нет корректных чисел»</text>
+<text x="100.75" y="76.66" font-size="3.88" text-anchor="middle">Конец</text>
+<text x="43.00" y="67.16" font-size="3.88" text-anchor="middle">total = sum(data)</text>
+<text x="43.00" y="83.21" font-size="3.88" text-anchor="middle">Вывод: «Сумма: », total,</text>
+<text x="43.00" y="88.11" font-size="3.88" text-anchor="middle">«, максимум: », max(data)</text>
+<text x="43.00" y="104.21" font-size="3.88" text-anchor="middle">Вывод: «Простых: », countPrimes(data),</text>
+<text x="43.00" y="109.11" font-size="3.88" text-anchor="middle">«, цифр: », digits(total)</text>
+<text x="43.00" y="125.21" font-size="3.88" text-anchor="middle">Вывод: grade(total / data.length),</text>
+<text x="43.00" y="130.11" font-size="3.88" text-anchor="middle">«, », dayName(data[0])</text>
+<text x="43.00" y="146.16" font-size="3.88" text-anchor="middle">Конец</text>
+<text x="44.80" y="59.20" font-size="3.53" text-anchor="start">Нет</text>
+<text x="64.50" y="43.70" font-size="3.53" text-anchor="start">Да</text>
+<text x="40.50" y="33.70" font-size="3.17" text-anchor="end" font-weight="bold">№1 · ур. 0</text>
+</g></svg>
