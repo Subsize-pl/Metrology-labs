@@ -1,628 +1,337 @@
-import com.sun.source.tree.AssertTree;
-import com.sun.source.tree.BlockTree;
-import com.sun.source.tree.BreakTree;
-import com.sun.source.tree.CaseLabelTree;
-import com.sun.source.tree.CaseTree;
-import com.sun.source.tree.ClassTree;
-import com.sun.source.tree.CompilationUnitTree;
-import com.sun.source.tree.ConditionalExpressionTree;
-import com.sun.source.tree.ContinueTree;
-import com.sun.source.tree.DoWhileLoopTree;
-import com.sun.source.tree.EmptyStatementTree;
-import com.sun.source.tree.EnhancedForLoopTree;
-import com.sun.source.tree.ExpressionStatementTree;
-import com.sun.source.tree.ExpressionTree;
-import com.sun.source.tree.ForLoopTree;
-import com.sun.source.tree.IfTree;
-import com.sun.source.tree.LabeledStatementTree;
-import com.sun.source.tree.MethodTree;
-import com.sun.source.tree.ReturnTree;
-import com.sun.source.tree.StatementTree;
-import com.sun.source.tree.SwitchExpressionTree;
-import com.sun.source.tree.SwitchTree;
-import com.sun.source.tree.SynchronizedTree;
-import com.sun.source.tree.ThrowTree;
-import com.sun.source.tree.Tree;
-import com.sun.source.tree.TryTree;
-import com.sun.source.tree.VariableTree;
-import com.sun.source.tree.WhileLoopTree;
-import com.sun.source.tree.YieldTree;
+import com.sun.source.tree.*;
 import com.sun.source.util.JavacTask;
 import com.sun.source.util.SourcePositions;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.net.URI;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.Deque;
-import java.util.EnumMap;
-import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
 import javax.tools.Diagnostic;
 import javax.tools.DiagnosticCollector;
-import javax.tools.JavaCompiler;
 import javax.tools.JavaFileObject;
 import javax.tools.SimpleJavaFileObject;
 import javax.tools.ToolProvider;
 
 /**
- * Рассчитывает метрику Джилба (CL, cl, CLI) и цикломатическое число Маккейба
- * для исходного текста на Java.
- *
- * <p>Текст разбирается штатным парсером javac (Compiler Tree API), поэтому
- * ключевые слова в комментариях, строках и текстовых блоках не влияют на
- * результат. Затем дерево обходится один раз, и каждый узел классифицируется
- * по правилам, изложенным в README:
- *
- * <ul>
- *   <li><b>оператор</b> (знаменатель cl) — любой оператор по JLS, гл. 14;</li>
- *   <li><b>ветвление</b> (числитель CL) — {@code if}, цикл или метка
- *       {@code case}; {@code switch} заменяется цепочкой вложенных
- *       {@code if}, селектор и {@code default} условием не считаются.</li>
- * </ul>
+ * Метрика Джилба для кода на Java: CL — число ветвлений (if, else if, циклы, метки case),
+ * N — число операторов, cl = CL / N, CLI — наибольшая вложенность ветвлений (внешнее — 0).
+ * switch считается как цепочка вложенных if.
  */
 public final class GilbAnalyzer {
-    private static final String WRAPPER_CLASS = "Fragment__";
-    private static final String WRAPPER_METHOD = "fragment__";
-    private static final long STACK_BYTES = 128L << 20;
 
-    /** Анализ с настройками по методике. */
-    public GilbMetrics analyze(String source) {
-        return analyze(source, GilbOptions.METHODOLOGY);
+    /** Ветвление: строка, вид, условие и уровень вложенности. */
+    public record Branching(int line, String kind, String condition, int level) {
     }
 
-    public GilbMetrics analyze(String source, GilbOptions options) {
-        String text = source == null ? "" : stripByteOrderMark(source);
-        // Глубоко вложенный код рекурсивно обходится парсером и сканером,
-        // поэтому работаем в потоке с большим стеком.
-        AtomicReference<GilbMetrics> result = new AtomicReference<>();
-        AtomicReference<Throwable> failure = new AtomicReference<>();
+    public record Result(int operators, List<Branching> branchings,
+                         Map<String, Integer> operatorKinds, List<String> errors) {
+        public int absolute() {
+            return branchings.size();
+        }
+
+        public double relative() {
+            return operators == 0 ? 0 : (double) absolute() / operators;
+        }
+
+        public int maxNesting() {
+            return branchings.stream().mapToInt(Branching::level).max().orElse(0);
+        }
+    }
+
+    private GilbAnalyzer() {
+    }
+
+    /** Сначала читаем как целый файл, если не вышло — как набор операторов без класса. */
+    public static Result analyze(String source) {
+        // парсер рекурсивный, на глубокой вложенности нужен большой стек
+        Object[] box = new Object[1];
         Thread worker = new Thread(null, () -> {
             try {
-                result.set(analyzeText(text, options));
-            } catch (Throwable error) {
-                failure.set(error);
+                box[0] = analyzeText(source);
+            } catch (Throwable e) {
+                box[0] = e;
             }
-        }, "gilb-analyzer", STACK_BYTES);
+        }, "gilb-analyzer", 1L << 30);
         worker.start();
         try {
             worker.join();
-        } catch (InterruptedException interrupted) {
+        } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("Анализ прерван", interrupted);
         }
-        if (failure.get() instanceof RuntimeException runtime) {
-            throw runtime;
+        if (box[0] instanceof Result result) {
+            return result;
         }
-        if (failure.get() != null) {
-            throw new IllegalStateException("Не удалось разобрать код", failure.get());
-        }
-        return result.get();
+        throw new IllegalStateException("Не удалось разобрать код: " + box[0]);
     }
 
-    /** Блокнот Windows сохраняет UTF-8 с меткой BOM (U+FEFF); javac её не принимает. */
-    private static String stripByteOrderMark(String text) {
-        return !text.isEmpty() && text.charAt(0) == 0xFEFF ? text.substring(1) : text;
-    }
-
-    private static GilbMetrics analyzeText(String text, GilbOptions options) {
-        ParsedSource parsed = parseBestInterpretation(text);
-        MetricScanner scanner = new MetricScanner(parsed, options);
-        scanner.scan(new TreePath(parsed.unit()), null);
-        return scanner.toMetrics();
-    }
-
-    // ---------------------------------------------------------------- разбор
-
-    /**
-     * Пробует прочитать текст как файл, как набор членов класса и как набор
-     * операторов; берёт первую трактовку без ошибок, иначе — с наименьшим их
-     * числом. Так анализатор принимает и целую программу, и вырезанный метод,
-     * и несколько строк кода.
-     */
-    private static ParsedSource parseBestInterpretation(String text) {
-        ParsedSource best = null;
-        for (GilbMetrics.ParseMode mode : GilbMetrics.ParseMode.values()) {
-            ParsedSource candidate = parse(text, mode);
-            if (candidate.problems().isEmpty()) {
-                return candidate;
-            }
-            if (best == null || candidate.problems().size() < best.problems().size()) {
-                best = candidate;
-            }
+    private static Result analyzeText(String source) {
+        String text = source.startsWith("﻿") ? source.substring(1) : source;
+        Result whole = analyze(text, "", 0);
+        if (whole.errors().isEmpty()) {
+            return whole;
         }
-        return best;
+        Result fragment = analyze(text, "class Fragment { void fragment() {\n", 1);
+        return fragment.errors().size() < whole.errors().size() ? fragment : whole;
     }
 
-    private static ParsedSource parse(String text, GilbMetrics.ParseMode mode) {
-        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+    private static Result analyze(String text, String prefix, int lineShift) {
+        String code = prefix.isEmpty() ? text : prefix + text + "\n} }";
+        var diagnostics = new DiagnosticCollector<JavaFileObject>();
+        var compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) {
-            throw new IllegalStateException(
-                    "Нужен JDK: в этой среде нет компилятора javac (модуль jdk.compiler)");
+            throw new IllegalStateException("Нужен JDK (модуль jdk.compiler), а не JRE");
         }
-        String wrapped = wrap(text, mode);
-        int lineOffset = mode == GilbMetrics.ParseMode.COMPILATION_UNIT ? 0 : 1;
-        DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
-        JavacTask task = (JavacTask) compiler.getTask(null, null, diagnostics,
-                List.of("-proc:none"), null, List.of(new SourceFile(wrapped)));
+        var task = (JavacTask) compiler.getTask(null, null, diagnostics,
+                List.of("-proc:none"), null, List.of(new Source(code)));
+        CompilationUnitTree unit;
         try {
-            CompilationUnitTree unit = task.parse().iterator().next();
-            SourcePositions positions = Trees.instance(task).getSourcePositions();
-            return new ParsedSource(unit, positions, mode, lineOffset,
-                    problems(diagnostics, lineOffset));
-        } catch (IOException exception) {
-            throw new UncheckedIOException(exception);
+            unit = task.parse().iterator().next();
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
         }
-    }
+        var counter = new Counter(code, unit, Trees.instance(task).getSourcePositions(), lineShift);
+        counter.scan(new TreePath(unit), null);
 
-    private static String wrap(String text, GilbMetrics.ParseMode mode) {
-        return switch (mode) {
-            case COMPILATION_UNIT -> text;
-            case CLASS_MEMBERS -> "class " + WRAPPER_CLASS + " {\n" + text + "\n}\n";
-            case STATEMENTS -> "class " + WRAPPER_CLASS + " { void " + WRAPPER_METHOD
-                    + "() {\n" + text + "\n} }\n";
-        };
-    }
-
-    private static List<GilbMetrics.SyntaxProblem> problems(
-            DiagnosticCollector<JavaFileObject> diagnostics, int lineOffset) {
-        List<GilbMetrics.SyntaxProblem> problems = new ArrayList<>();
-        for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
-            if (diagnostic.getKind() == Diagnostic.Kind.ERROR) {
-                int line = (int) Math.max(1, diagnostic.getLineNumber() - lineOffset);
-                problems.add(new GilbMetrics.SyntaxProblem(
-                        line, diagnostic.getMessage(Locale.ENGLISH)));
+        List<String> errors = new ArrayList<>();
+        for (Diagnostic<? extends JavaFileObject> d : diagnostics.getDiagnostics()) {
+            if (d.getKind() == Diagnostic.Kind.ERROR) {
+                errors.add("строка " + Math.max(1, d.getLineNumber() - lineShift) + ": "
+                        + d.getMessage(Locale.getDefault()));
             }
         }
-        return problems;
+        return new Result(counter.operators, counter.branchings, counter.kinds, errors);
     }
 
-    private record ParsedSource(CompilationUnitTree unit, SourcePositions positions,
-                                GilbMetrics.ParseMode mode, int lineOffset,
-                                List<GilbMetrics.SyntaxProblem> problems) {
-    }
+    private static final class Source extends SimpleJavaFileObject {
+        private final String code;
 
-    private static final class SourceFile extends SimpleJavaFileObject {
-        private final String source;
-
-        private SourceFile(String source) {
-            super(URI.create("string:///AnalyzedSource.java"), Kind.SOURCE);
-            this.source = source;
+        Source(String code) {
+            super(URI.create("string:///Analyzed.java"), Kind.SOURCE);
+            this.code = code;
         }
 
         @Override
         public CharSequence getCharContent(boolean ignoreEncodingErrors) {
-            return source;
+            return code;
         }
     }
 
-    // ----------------------------------------------------------------- подсчёт
-
-    /** Счётчики одной подпрограммы (метода, конструктора, блока инициализации). */
-    private static final class Frame {
-        private final String name;
-        private final int line;
-        private int operators;
-        private int branchings;
-        private int maxNesting;
-
-        private Frame(String name, int line) {
-            this.name = name;
-            this.line = line;
-        }
-    }
-
-    /**
-     * Обход дерева. Поле {@code level} — сколько ветвлений охватывает текущую
-     * точку; в этот момент ветвление и записывается как его уровень.
-     */
-    private static final class MetricScanner extends TreePathScanner<Void, Void> {
-        private final GilbOptions options;
-        private final ParsedSource parsed;
+    /** Один проход по дереву: считает операторы и ветвления. */
+    private static final class Counter extends TreePathScanner<Void, Void> {
+        private final String code;
         private final CompilationUnitTree unit;
         private final SourcePositions positions;
+        private final int lineShift;
 
-        private final List<GilbMetrics.Branching> branchings = new ArrayList<>();
-        private final Map<GilbMetrics.StatementKind, Integer> statements =
-                new EnumMap<>(GilbMetrics.StatementKind.class);
-        private final Deque<Frame> openFrames = new ArrayDeque<>();
-        private final List<Frame> closedFrames = new ArrayList<>();
-        /** Второй и последующие declarator'ы одного объявления: {@code int a, b;}. */
-        private final Set<Tree> continuationDeclarators =
-                Collections.newSetFromMap(new IdentityHashMap<>());
-        private final Frame outsideMethods = new Frame("(вне подпрограмм)", 0);
-        private int operatorCount;
+        final List<Branching> branchings = new ArrayList<>();
+        final Map<String, Integer> kinds = new LinkedHashMap<>();
+        int operators;
         private int level;
+        private long lastDeclarationStart = -1;
 
-        private MetricScanner(ParsedSource parsed, GilbOptions options) {
-            this.parsed = parsed;
-            this.options = options;
-            this.unit = parsed.unit();
-            this.positions = parsed.positions();
-            openFrames.push(outsideMethods);
+        Counter(String code, CompilationUnitTree unit, SourcePositions positions, int lineShift) {
+            this.code = code;
+            this.unit = unit;
+            this.positions = positions;
+            this.lineShift = lineShift;
         }
 
-        private GilbMetrics toMetrics() {
-            List<Frame> frames = new ArrayList<>(closedFrames);
-            if (outsideMethods.operators > 0 || outsideMethods.branchings > 0) {
-                frames.add(outsideMethods);
-            }
-            frames.sort(Comparator.comparingInt(frame -> frame.line));
-            List<GilbMetrics.MethodStats> methods = new ArrayList<>();
-            for (Frame frame : frames) {
-                methods.add(new GilbMetrics.MethodStats(frame.name, frame.line,
-                        frame.operators, frame.branchings, frame.maxNesting));
-            }
-            return new GilbMetrics(options, parsed.mode(), operatorCount, branchings,
-                    statements, methods, parsed.problems());
+        private void operator(String kind) {
+            operators++;
+            kinds.merge(kind, 1, Integer::sum);
         }
 
-        // --- регистрация найденного
-
-        private void countOperator(GilbMetrics.StatementKind kind) {
-            operatorCount++;
-            statements.merge(kind, 1, Integer::sum);
-            openFrames.peek().operators++;
+        private void branching(String kind, Tree at, String condition) {
+            long start = positions.getStartPosition(unit, at);
+            int line = (int) Math.max(1, unit.getLineMap().getLineNumber(start) - lineShift);
+            branchings.add(new Branching(line, kind, condition, level));
         }
 
-        private void countBranching(GilbMetrics.BranchingKind kind, Tree at, int atLevel) {
-            branchings.add(new GilbMetrics.Branching(kind, lineOf(at), atLevel));
-            Frame frame = openFrames.peek();
-            frame.branchings++;
-            frame.maxNesting = Math.max(frame.maxNesting, atLevel);
-        }
-
-        private int lineOf(Tree tree) {
+        private String text(Tree tree) {
             long start = positions.getStartPosition(unit, tree);
-            long line = start < 0 ? 1 : unit.getLineMap().getLineNumber(start);
-            return (int) Math.max(1, line - parsed.lineOffset());
+            long end = positions.getEndPosition(unit, tree);
+            if (start < 0 || end <= start) {
+                return "";
+            }
+            String s = code.substring((int) start, (int) end).replaceAll("\\s+", " ").trim();
+            return s.startsWith("(") && s.endsWith(")") ? s.substring(1, s.length() - 1) : s;
         }
 
-        private Tree parentOfCurrent() {
+        private Tree parent() {
             return getCurrentPath().getParentPath().getLeaf();
         }
 
-        // --- подпрограммы и блоки
-
-        @Override
-        public Void visitMethod(MethodTree node, Void unused) {
-            if (node.getBody() == null) {
-                return null; // abstract / native / метод интерфейса без тела
-            }
-            openFrames.push(new Frame(describe(node), lineOf(node)));
-            scan(node.getBody(), unused);
-            closedFrames.add(openFrames.pop());
-            return null;
-        }
-
-        private String describe(MethodTree method) {
-            String owner = enclosingClassName();
-            String name = method.getName().contentEquals("<init>")
-                    ? owner : method.getName().toString();
-            if (name.equals(WRAPPER_METHOD)) {
-                return "(операторы фрагмента)";
-            }
-            StringBuilder parameters = new StringBuilder();
-            for (VariableTree parameter : method.getParameters()) {
-                if (parameters.length() > 0) {
-                    parameters.append(", ");
-                }
-                parameters.append(parameter.getType());
-            }
-            String prefix = owner.equals(WRAPPER_CLASS) ? "" : owner + ".";
-            return prefix + name + "(" + parameters + ")";
-        }
-
-        private String enclosingClassName() {
-            for (TreePath path = getCurrentPath(); path != null; path = path.getParentPath()) {
-                if (path.getLeaf() instanceof ClassTree owner) {
-                    String name = owner.getSimpleName().toString();
-                    return name.isEmpty() ? "<anonymous>" : name;
-                }
-            }
-            return "";
-        }
-
-        @Override
-        public Void visitBlock(BlockTree node, Void unused) {
-            markContinuationDeclarators(node.getStatements());
-            Tree parent = parentOfCurrent();
-            if (parent instanceof ClassTree) { // блок инициализации класса
-                String name = node.isStatic()
-                        ? "(static-блок инициализации)" : "(блок инициализации)";
-                openFrames.push(new Frame(name, lineOf(node)));
-                super.visitBlock(node, unused);
-                closedFrames.add(openFrames.pop());
-                return null;
-            }
-            if (options.blocksAreOperators() && isStatementPosition(parent)) {
-                countOperator(GilbMetrics.StatementKind.BLOCK);
-            }
-            return super.visitBlock(node, unused);
-        }
-
-        /**
-         * Блок — оператор только там, где грамматика ждёт Statement. Тело
-         * метода, лямбды, try/catch/finally, synchronized и {@code ->}-правило
-         * switch — это Block, а не Statement.
-         */
-        private static boolean isStatementPosition(Tree parent) {
-            return switch (parent.getKind()) {
-                case BLOCK, IF, WHILE_LOOP, DO_WHILE_LOOP, FOR_LOOP,
-                        ENHANCED_FOR_LOOP, LABELED_STATEMENT -> true;
-                case CASE -> ((CaseTree) parent).getCaseKind() == CaseTree.CaseKind.STATEMENT;
-                default -> false;
-            };
-        }
-
-        /**
-         * javac превращает {@code int a = 1, b = 2;} в два VariableTree с общим
-         * началом. По JLS 14.4 это один оператор, поэтому второй и следующие
-         * declarator'ы запоминаются, чтобы не считать их повторно.
-         */
-        private void markContinuationDeclarators(List<? extends StatementTree> list) {
-            if (list == null) {
-                return;
-            }
-            long previousStart = -1;
-            for (StatementTree statement : list) {
-                if (statement instanceof VariableTree variable) {
-                    long start = positions.getStartPosition(unit, variable);
-                    if (start == previousStart) {
-                        continuationDeclarators.add(variable);
-                    }
-                    previousStart = start;
-                } else {
-                    previousStart = -1;
-                }
-            }
-        }
-
-        // --- операторы, не являющиеся ветвлениями
-
-        @Override
-        public Void visitVariable(VariableTree node, Void unused) {
-            if (options.declarationsAreOperators() && isDeclarationStatement(node)) {
-                countOperator(GilbMetrics.StatementKind.DECLARATION);
-            }
-            return super.visitVariable(node, unused);
-        }
-
-        /** Поля, параметры, переменные for/catch/try в N не входят. */
-        private boolean isDeclarationStatement(VariableTree node) {
-            Tree.Kind parent = parentOfCurrent().getKind();
-            return (parent == Tree.Kind.BLOCK || parent == Tree.Kind.CASE)
-                    && !continuationDeclarators.contains(node);
-        }
-
-        @Override
-        public Void visitExpressionStatement(ExpressionStatementTree node, Void unused) {
-            if (!isForHeaderExpression(node)) {
-                countOperator(GilbMetrics.StatementKind.EXPRESSION);
-            }
-            return super.visitExpressionStatement(node, unused);
-        }
-
-        /**
-         * Выражения в init и update заголовка for — часть оператора for, а не
-         * отдельные операторы. Тело for без скобок (то же родительское дерево)
-         * обычным оператором остаётся.
-         */
-        private boolean isForHeaderExpression(ExpressionStatementTree node) {
-            return parentOfCurrent() instanceof ForLoopTree loop
-                    && (loop.getInitializer().contains(node) || loop.getUpdate().contains(node));
-        }
-
-        @Override
-        public Void visitBreak(BreakTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.BREAK);
-            return super.visitBreak(node, unused);
-        }
-
-        @Override
-        public Void visitContinue(ContinueTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.CONTINUE);
-            return super.visitContinue(node, unused);
-        }
-
-        @Override
-        public Void visitReturn(ReturnTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.RETURN);
-            return super.visitReturn(node, unused);
-        }
-
-        @Override
-        public Void visitThrow(ThrowTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.THROW);
-            return super.visitThrow(node, unused);
-        }
-
-        @Override
-        public Void visitTry(TryTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.TRY);
-            return super.visitTry(node, unused);
-        }
-
-        @Override
-        public Void visitSynchronized(SynchronizedTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.SYNCHRONIZED);
-            return super.visitSynchronized(node, unused);
-        }
-
-        @Override
-        public Void visitAssert(AssertTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.ASSERT);
-            return super.visitAssert(node, unused);
-        }
-
-        @Override
-        public Void visitYield(YieldTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.YIELD);
-            return super.visitYield(node, unused);
-        }
-
-        @Override
-        public Void visitLabeledStatement(LabeledStatementTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.LABELED);
-            return super.visitLabeledStatement(node, unused);
-        }
-
-        @Override
-        public Void visitEmptyStatement(EmptyStatementTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.EMPTY);
-            return super.visitEmptyStatement(node, unused);
-        }
-
-        // --- ветвления: if
-
-        @Override
-        public Void visitIf(IfTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.IF);
-            countBranching(GilbMetrics.BranchingKind.IF, node, level);
-            scan(node.getCondition(), unused);
-            scanNested(node.getThenStatement(), true);
-            // else if — это if внутри ветки else, поэтому он на уровень глубже
-            scanNested(node.getElseStatement(), true);
-            return null;
-        }
-
-        // --- ветвления: циклы
-
-        @Override
-        public Void visitWhileLoop(WhileLoopTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.WHILE);
-            boolean nested = recordLoop(GilbMetrics.BranchingKind.WHILE, node);
-            scan(node.getCondition(), unused);
-            scanNested(node.getStatement(), nested);
-            return null;
-        }
-
-        @Override
-        public Void visitDoWhileLoop(DoWhileLoopTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.DO_WHILE);
-            boolean nested = recordLoop(GilbMetrics.BranchingKind.DO_WHILE, node);
-            scanNested(node.getStatement(), nested);
-            scan(node.getCondition(), unused);
-            return null;
-        }
-
-        @Override
-        public Void visitForLoop(ForLoopTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.FOR);
-            boolean nested = recordLoop(GilbMetrics.BranchingKind.FOR, node);
-            scan(node.getInitializer(), unused);
-            scan(node.getCondition(), unused);
-            scan(node.getUpdate(), unused);
-            scanNested(node.getStatement(), nested);
-            return null;
-        }
-
-        @Override
-        public Void visitEnhancedForLoop(EnhancedForLoopTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.FOR_EACH);
-            boolean nested = recordLoop(GilbMetrics.BranchingKind.FOR_EACH, node);
-            scan(node.getVariable(), unused);
-            scan(node.getExpression(), unused);
-            scanNested(node.getStatement(), nested);
-            return null;
-        }
-
-        /** Записывает цикл как ветвление, если так настроено; true — тело вложено. */
-        private boolean recordLoop(GilbMetrics.BranchingKind kind, Tree loop) {
-            if (!options.loopsAreBranchings()) {
-                return false;
-            }
-            countBranching(kind, loop, level);
-            return true;
-        }
-
-        private void scanNested(Tree body, boolean deeper) {
-            if (deeper) {
-                level++;
-            }
+        /** Тело ветвления на уровень глубже. */
+        private void nested(Tree body) {
+            level++;
             scan(body, null);
-            if (deeper) {
-                level--;
-            }
+            level--;
         }
 
-        // --- ветвления: switch и ?:
+        // ветвления
 
         @Override
-        public Void visitSwitch(SwitchTree node, Void unused) {
-            countOperator(GilbMetrics.StatementKind.SWITCH);
-            scanSwitch(node.getExpression(), node.getCases());
+        public Void visitIf(IfTree node, Void v) {
+            operator("if");
+            boolean elseIf = parent() instanceof IfTree outer && outer.getElseStatement() == node;
+            branching(elseIf ? "else if" : "if", node, text(node.getCondition()));
+            nested(node.getThenStatement());
+            nested(node.getElseStatement()); // else if — это if внутри else, поэтому глубже
             return null;
         }
 
         @Override
-        public Void visitSwitchExpression(SwitchExpressionTree node, Void unused) {
-            scanSwitch(node.getExpression(), node.getCases());
+        public Void visitForLoop(ForLoopTree node, Void v) {
+            operator("for");
+            branching("for", node, node.getCondition() == null ? "true" : text(node.getCondition()));
+            nested(node.getStatement());
             return null;
         }
 
         @Override
-        public Void visitCase(CaseTree node, Void unused) {
-            markContinuationDeclarators(node.getStatements());
-            return super.visitCase(node, unused);
+        public Void visitEnhancedForLoop(EnhancedForLoopTree node, Void v) {
+            operator("for-each");
+            branching("for-each", node, node.getVariable().getName() + " : " + text(node.getExpression()));
+            nested(node.getStatement());
+            return null;
         }
 
-        /**
-         * switch с k метками {@code case} эквивалентен цепочке из k вложенных
-         * if: метка j — это if на уровне {@code base + j − 1}, а оператор(ы) под
-         * ней лежат внутри этого if. Ветка {@code default} — последний
-         * {@code else} цепочки; селектор и {@code default} ветвлениями не
-         * считаются.
-         */
-        private void scanSwitch(ExpressionTree selector, List<? extends CaseTree> cases) {
-            scan(selector, null);
+        @Override
+        public Void visitWhileLoop(WhileLoopTree node, Void v) {
+            operator("while");
+            branching("while", node, text(node.getCondition()));
+            nested(node.getStatement());
+            return null;
+        }
+
+        @Override
+        public Void visitDoWhileLoop(DoWhileLoopTree node, Void v) {
+            operator("do-while");
+            branching("do-while", node, text(node.getCondition()));
+            nested(node.getStatement());
+            return null;
+        }
+
+        @Override
+        public Void visitSwitch(SwitchTree node, Void v) {
+            operator("switch");
+            switchAsIfs(node.getExpression(), node.getCases());
+            return null;
+        }
+
+        @Override
+        public Void visitSwitchExpression(SwitchExpressionTree node, Void v) {
+            switchAsIfs(node.getExpression(), node.getCases());
+            return null;
+        }
+
+        /** k-я метка case — это if на уровне base + k - 1, default — последний else. */
+        private void switchAsIfs(ExpressionTree selector, List<? extends CaseTree> cases) {
             int base = level;
-            int labelCount = 0;
-            for (CaseTree entry : cases) {
-                for (CaseLabelTree label : entry.getLabels()) {
-                    if (label.getKind() != Tree.Kind.DEFAULT_CASE_LABEL) {
-                        labelCount++;
+            int labels = 0;
+            for (CaseTree c : cases) {
+                for (CaseLabelTree label : c.getLabels()) {
+                    if (!(label instanceof DefaultCaseLabelTree)) {
+                        labels++;
                     }
                 }
             }
             int seen = 0;
-            for (CaseTree entry : cases) {
-                boolean hasDefault = false;
-                for (CaseLabelTree label : entry.getLabels()) {
-                    if (label.getKind() == Tree.Kind.DEFAULT_CASE_LABEL) {
-                        hasDefault = true;
+            for (CaseTree c : cases) {
+                boolean isDefault = false;
+                for (CaseLabelTree label : c.getLabels()) {
+                    if (label instanceof DefaultCaseLabelTree) {
+                        isDefault = true;
                     } else {
-                        countBranching(GilbMetrics.BranchingKind.CASE, label, base + seen);
-                        seen++;
+                        level = base + seen++;
+                        branching("case", label, text(selector) + " == " + text(label));
                     }
                 }
-                level = hasDefault ? base + labelCount : base + seen;
-                scan(entry, null);
+                level = base + (isDefault ? labels : seen);
+                scan(c.getStatements() != null ? c.getStatements() : List.of(c.getBody()), null);
             }
             level = base;
         }
 
+        // остальные операторы
+
         @Override
-        public Void visitConditionalExpression(ConditionalExpressionTree node, Void unused) {
-            if (!options.ternaryIsBranching()) {
-                return super.visitConditionalExpression(node, unused);
+        public Void visitVariable(VariableTree node, Void v) {
+            // поля, параметры и переменные в заголовках for/catch не считаем;
+            // int a = 1, b = 2; — один оператор
+            Tree p = parent();
+            long start = positions.getStartPosition(unit, node);
+            if ((p instanceof BlockTree || p instanceof CaseTree) && start != lastDeclarationStart) {
+                operator("объявление переменной");
             }
-            countBranching(GilbMetrics.BranchingKind.TERNARY, node, level);
-            scan(node.getCondition(), unused);
-            level++;
-            scan(node.getTrueExpression(), unused);
-            scan(node.getFalseExpression(), unused);
-            level--;
+            lastDeclarationStart = start;
+            return super.visitVariable(node, v);
+        }
+
+        @Override
+        public Void visitExpressionStatement(ExpressionStatementTree node, Void v) {
+            // заголовок for не обходим, так что i = 0 и i++ сюда не попадают
+            operator("выражение (присваивание, ++, вызов)");
+            return super.visitExpressionStatement(node, v);
+        }
+
+        @Override
+        public Void visitBreak(BreakTree node, Void v) {
+            operator("break");
             return null;
+        }
+
+        @Override
+        public Void visitContinue(ContinueTree node, Void v) {
+            operator("continue");
+            return null;
+        }
+
+        @Override
+        public Void visitReturn(ReturnTree node, Void v) {
+            operator("return");
+            return super.visitReturn(node, v);
+        }
+
+        @Override
+        public Void visitThrow(ThrowTree node, Void v) {
+            operator("throw");
+            return super.visitThrow(node, v);
+        }
+
+        @Override
+        public Void visitTry(TryTree node, Void v) {
+            operator("try");
+            return super.visitTry(node, v);
+        }
+
+        @Override
+        public Void visitYield(YieldTree node, Void v) {
+            operator("yield");
+            return super.visitYield(node, v);
+        }
+
+        @Override
+        public Void visitAssert(AssertTree node, Void v) {
+            operator("assert");
+            return super.visitAssert(node, v);
+        }
+
+        @Override
+        public Void visitSynchronized(SynchronizedTree node, Void v) {
+            operator("synchronized");
+            return super.visitSynchronized(node, v);
+        }
+
+        @Override
+        public Void visitLabeledStatement(LabeledStatementTree node, Void v) {
+            operator("метка");
+            return super.visitLabeledStatement(node, v);
         }
     }
 }
